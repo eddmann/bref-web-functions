@@ -9,7 +9,7 @@ of Bref lifecycle hooks currently implemented.
 
 | Area | Status |
 | --- | --- |
-| Bref PHP 8.4 and ordinary FPM request cleanup | Verified locally on x86_64 |
+| Bref PHP 8.4 and ordinary FPM request cleanup | Verified in native AMD64 and ARM64 CI |
 | Composer and actual Bref 3.0.15 classes | Verified with the pinned test fixture |
 | Application `php/conf.d/` and configured native extensions | Verified locally, including `intl` |
 | `beforeStartup` | Called by the initialization helper; environment changes carry forward |
@@ -22,7 +22,8 @@ of Bref lifecycle hooks currently implemented.
 | File and non-file session configuration | Preserved; an external session backend has not been exercised |
 | Real AWS credentials, refresh and secrets retrieval | Unverified |
 | Full Laravel/Symfony applications | Unverified |
-| Native ARM64 and actual Lambda Web Functions | Unverified |
+| Native ARM64 runtime and exact archive execution | Verified in CI |
+| Actual Lambda Web Functions deployment | Unverified |
 
 FPM resets ordinary PHP request state between requests, including reused workers.
 OPcache, temporary files, sessions and external services can still be shared.

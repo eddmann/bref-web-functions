@@ -9,10 +9,10 @@ Each environment can run several PHP workers while AWS manages HTTP ingress and
 scaling. A thin Node 24 launcher starts initialization and supervises the runtime;
 application HTTP requests go directly to Rust.
 
-**Status:** local x86_64 containers and exact deployment archives have passed
-integration tests. An ARM64 archive has been built and inspected, but native
-ARM64 and AWS execution have not been verified. Full Laravel/Symfony application
-validation and production hardening remain. See [verification](docs/verification.md),
+**Status:** native AMD64 and ARM64 CI passed the Rust/Caddy integration suites,
+exact deployment archive tests and real Bref dependency checks. Actual AWS
+execution, full Laravel/Symfony application validation and production hardening
+remain. See [verification](docs/verification.md),
 [compatibility](docs/compatibility.md) and the [roadmap](docs/roadmap.md).
 
 ## Run locally
