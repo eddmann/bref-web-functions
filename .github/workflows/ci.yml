@@ -115,6 +115,14 @@ jobs:
             --suite integration --output results/ci/package-integration \
             > results/ci/package-integration.log 2>&1
 
+      - name: Check runtime retirement and stalled connections
+        run: |
+          set -euo pipefail
+          python3 tests/hardening/run.py \
+            --binary build/ci/bref-web-gateway \
+            --output results/ci/hardening.json \
+            > results/ci/hardening.log 2>&1
+
       - name: Install locked real Bref dependencies
         run: |
           set -euo pipefail

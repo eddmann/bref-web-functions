@@ -1,7 +1,5 @@
 use anyhow::{bail, Context, Result};
-use bref_web_gateway::{config::Config, gateway::Gateway};
-use hyper::{server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
+use bref_web_gateway::{config::Config, connection, gateway::Gateway};
 use nix::{
     sys::signal::{killpg, Signal},
     unistd::Pid,
@@ -90,12 +88,20 @@ async fn serve(
         config.endpoint, config.fpm_addr, config.max_in_flight
     );
     let gateway = Arc::new(Gateway::new(config.clone()));
+    let mut retirement = gateway.retirement();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut master_failure = None;
     loop {
         tokio::select! {
             _ = &mut signal => { break; }
+            _ = retirement.changed() => {
+                master_failure = Some(format!(
+                    "runtime retiring: {}",
+                    retirement.borrow().unwrap_or("retirement notification closed")
+                ));
+                break;
+            }
             status = async { match child { Some(child) => child.wait().await, None => pending().await } } => {
                 master_failure = Some(format!("PHP-FPM master exited unexpectedly: {status:?}"));
                 break;
@@ -103,14 +109,10 @@ async fn serve(
             connection = listener.accept() => {
                 let (stream, _) = connection.context("accepting HTTP connection")?;
                 let service_gateway = gateway.clone();
-                let mut shutdown = shutdown_receiver.clone();
+                let shutdown = shutdown_receiver.clone();
                 connections.spawn(async move {
-                    let service = service_fn(move |request| service_gateway.clone().handle(request));
-                    let connection = http1::Builder::new().max_buf_size(65_536).keep_alive(true).serve_connection(TokioIo::new(stream), service);
-                    tokio::pin!(connection);
-                    tokio::select! {
-                        result = &mut connection => { if let Err(error) = result { eprintln!("bref-web http_connection_error={error}"); } }
-                        _ = shutdown.changed() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; }
+                    if let Err(error) = connection::serve(stream, service_gateway, shutdown).await {
+                        eprintln!("bref-web http_connection_error={error}");
                     }
                 });
             }
@@ -118,6 +120,7 @@ async fn serve(
         }
     }
     drop(listener);
+    gateway.close_admission();
     let _ = shutdown_sender.send(true);
     let shutdown_deadline = Instant::now() + config.shutdown_grace;
     gateway.drain(config.shutdown_grace).await;

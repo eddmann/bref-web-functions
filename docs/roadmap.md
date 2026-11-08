@@ -6,13 +6,13 @@ alone is not a reason to choose Rust for production.
 
 ## Runtime hardening
 
-1. Add controlled retirement/recovery when backend termination cannot be
-   confirmed. Current behavior closes admission until an external restart.
-2. Enforce hard deadlines for stalled downstream socket writes, beyond response
-   body polling timers.
-3. Fuzz FastCGI framing and HTTP/CGI mappings; expand cancellation, truncation,
+Controlled retirement on unconfirmed backend completion and connection-level
+write cutoffs are implemented, with native-process regression coverage. Continue
+hardening these boundaries:
+
+1. Fuzz FastCGI framing and HTTP/CGI mappings; expand cancellation, truncation,
    overload and process-death tests.
-4. Exercise long-running worker recycling, temporary-file cleanup, connection
+2. Exercise long-running worker recycling, temporary-file cleanup, connection
    reuse and memory behavior with a real framework application.
 
 ## AWS and application validation

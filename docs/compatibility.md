@@ -41,7 +41,7 @@ settings, not additional native Lambda worker controls.
 | `BREF_WEB_MAX_IN_FLIGHT` | `4` | FPM children and Rust active backend reservations |
 | `BREF_WEB_QUEUE_CAPACITY` | `4` | Extra admitted requests waiting for a worker |
 | `BREF_WEB_QUEUE_TIMEOUT_MS` | `1000` | Maximum Rust queue wait |
-| `BREF_WEB_REQUEST_TIMEOUT_MS` | `30000` | Rust HTTP deadline, including queue/body time |
+| `BREF_WEB_REQUEST_TIMEOUT_MS` | `30000` | Rust HTTP deadline, including queue/body time; transport cutoff adds 100 ms terminal-response grace |
 | `BREF_WEB_FPM_TIMEOUT_SECONDS` | `28` | FPM per-worker wall timeout |
 | `BREF_WEB_PHP_MEMORY_LIMIT` | `128M` | PHP allocation limit per worker |
 | `BREF_WEB_OPCACHE_MEMORY_MB` | `128` | Shared OPcache budget |
@@ -76,8 +76,11 @@ buffers the admitted request body; this version does not stream uploads into FPM
 `fastcgi_finish_request` stays disabled so PHP cannot deliberately report
 completion while hidden work continues. HTTP expiry/client disconnect does not
 immediately cancel PHP; backend reservations remain held until completion is
-confirmed. Hard stalled-client write deadlines and automatic recovery after
-unconfirmed backend work remain on the [roadmap](roadmap.md).
+confirmed. A connection watchdog cuts off stalled writes independently of body
+polling. If completion still cannot be confirmed, the runtime closes admission,
+drains within its shutdown budget and exits nonzero for replacement by its
+supervisor/platform. This does not add immediate PHP cancellation or an in-place
+pool restart. See [architecture](architecture.md) for deadline and shutdown details.
 
 CLI commands, queues and other event handlers should continue to use the existing
 Bref event/console runtimes. Extra PHP extensions must be bundled for the selected

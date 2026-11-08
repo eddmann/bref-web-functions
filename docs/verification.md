@@ -23,6 +23,23 @@ artifacts are retained for seven days under the workflow configuration.
 | Exact AMD64 and ARM64 smoke and HTTP test archives | Passed natively in the corresponding managed Node base image | [`scripts/test-package.py`](../scripts/test-package.py) |
 | ARM64 PHP libraries, native extensions and real Bref archive | Executed successfully in native ARM64 CI | [CI run](https://github.com/eddmann/bref-web-functions/actions/runs/42514318351) |
 
+## Runtime hardening checks
+
+The subsequent timeout/recovery change passed 20 Rust unit tests and four native
+process regressions locally on AMD64. The process checks cover bounded retirement
+after unconfirmed backend completion, healthy in-flight draining, FPM process-group
+cleanup, stalled clients, pipelining and keepalive deadline refresh/idle expiry.
+Deterministic in-memory blocked-write tests also verify the transport cutoff,
+including during graceful shutdown; ordinary OS socket stalls alone are sensitive
+to buffering and scheduling. See the [hardening harness](../tests/hardening/).
+
+The unchanged shared HTTP suite passed all 22 checks on each gateway, and both
+real-FPM lifecycle checks passed. Exact AMD64 archives passed the 22 HTTP checks
+and all nine real Bref checks in the managed Node base image. The CI workflow
+includes the new regressions on both native architectures; these local results
+do not by themselves establish ARM64 coverage of the change or AWS replacement
+behavior after a fatal runtime exit.
+
 ## What the archive tests establish
 
 The exact AMD64 and ARM64 ZIPs were extracted with hash, mode and symlink verification,

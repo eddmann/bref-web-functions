@@ -50,13 +50,32 @@ Responses stream through bounded buffers with backpressure.
 A backend task owns its reservation independently of the frontend response.
 Disconnecting or reaching an HTTP deadline does not prove PHP stopped. The task
 keeps accounting for backend work until FastCGI completion or termination is
-confirmed. Unconfirmed work currently closes admission until runtime restart.
+confirmed. The confirmation deadline is the later of the HTTP deadline and the
+FPM script deadline, plus two seconds. This allows a blocked frontend to close
+and backend output to drain before declaring completion unconfirmed.
+
+The connection driver independently enforces the HTTP deadline plus a fixed
+100 ms grace for flushing terminal responses such as 408/504. It drops the whole
+Hyper connection and socket at that cutoff, even when a write is blocked and no
+response-body frame is being polled. Each dispatched HTTP/1 keepalive request
+refreshes the deadline. The last deadline also bounds an idle connection after
+its response. Initial idle connections and incomplete headers before Hyper
+dispatches a request are outside this watchdog's scope.
 
 ## Process lifecycle
 
 Rust starts FPM in a dedicated process group. FPM enforces its per-worker request
 timeout and replenishes failed workers. A single worker failure does not require
 restarting the entire pool. An unexpected FPM master exit stops the Rust runtime.
+
+Unconfirmed backend completion triggers controlled retirement: admission closes,
+queued requests wake without dispatching new PHP work, and the listener stops.
+Already active requests have the configured shutdown grace to finish. Rust then
+terminates its FPM process group, closes remaining connections and exits nonzero;
+Node detects that exit and stops too. The runtime relies on the platform or
+operator to start a replacement, rather than remaining alive serving 503s or
+restarting the PHP pool in place. Actual Lambda replacement behavior still needs
+AWS validation.
 
 The default Rust shutdown grace is 500 ms, inside Node's 900 ms outer deadline.
 Surviving FPM processes are killed as a group. Abrupt process death cannot run
@@ -67,6 +86,7 @@ cleanup guards, and graceful shutdown does not guarantee durable work completion
 | File | Responsibility |
 | --- | --- |
 | [`src/main.rs`](../src/main.rs) | FPM supervision, HTTP connections and shutdown |
+| [`src/connection.rs`](../src/connection.rs) | Independent transport deadlines and keepalive connection driving |
 | [`src/gateway.rs`](../src/gateway.rs) | Admission, deadlines, bodies, streaming and backend accounting |
 | [`src/cgi.rs`](../src/cgi.rs) | HTTP/CGI mapping and PHP response headers |
 | [`src/fcgi.rs`](../src/fcgi.rs) | FastCGI framing and validation |

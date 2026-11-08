@@ -60,6 +60,10 @@ suite serially against Rust and Caddy, then checks Rust timeout/disconnect
 accounting. It uses a two-second FPM timeout for the deliberate hang tests and
 removes its containers afterward. Reports are written under ignored `results/`.
 
+The native [hardening suite](tests/hardening/) also checks controlled runtime
+retirement, process-group cleanup, stalled readers, pipelining and keepalive
+deadline refresh. Both architecture jobs run it against the exported binary.
+
 To include the small local benchmark:
 
 ```sh

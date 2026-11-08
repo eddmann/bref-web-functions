@@ -19,7 +19,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWriteExt},
     net::TcpStream,
-    sync::{mpsc, oneshot, Semaphore},
+    sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
     time::{timeout, timeout_at, Instant},
 };
 
@@ -83,17 +83,81 @@ pub struct Gateway {
     pub config: Arc<Config>,
     pub workers: Arc<Semaphore>,
     slots: Arc<Semaphore>,
-    healthy: Arc<AtomicBool>,
+    admission: Arc<Admission>,
+}
+
+struct Admission {
+    healthy: AtomicBool,
+    closed: watch::Sender<bool>,
+    retirement: watch::Sender<Option<&'static str>>,
+}
+
+impl Admission {
+    fn close(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.closed.send_replace(true);
+    }
+
+    fn retire(&self, reason: &'static str) {
+        self.close();
+        // The first unresolved backend determines retirement. Later failures
+        // must not replace the reason observed by the process supervisor.
+        self.retirement.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(reason);
+                true
+            }
+        });
+    }
+}
+
+enum AdmissionError {
+    Closed,
+    Expired,
 }
 
 impl Gateway {
     pub fn new(config: Config) -> Self {
         let total = config.max_in_flight.saturating_add(config.queue_capacity);
+        let (closed, _) = watch::channel(false);
+        let (retirement, _) = watch::channel(None);
         Self {
             workers: Arc::new(Semaphore::new(config.max_in_flight)),
             slots: Arc::new(Semaphore::new(total)),
             config: Arc::new(config),
-            healthy: Arc::new(AtomicBool::new(true)),
+            admission: Arc::new(Admission {
+                healthy: AtomicBool::new(true),
+                closed,
+                retirement,
+            }),
+        }
+    }
+
+    pub fn retirement(&self) -> watch::Receiver<Option<&'static str>> {
+        self.admission.retirement.subscribe()
+    }
+
+    pub fn close_admission(&self) {
+        self.admission.close();
+        self.slots.close();
+    }
+
+    async fn acquire_worker(
+        &self,
+        deadline: Instant,
+    ) -> Result<OwnedSemaphorePermit, AdmissionError> {
+        let mut closed = self.admission.closed.subscribe();
+        tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => Err(AdmissionError::Closed),
+            result = timeout_at(deadline, self.workers.clone().acquire_owned()) => {
+                match result {
+                    Ok(Ok(permit)) => Ok(permit),
+                    _ => Err(AdmissionError::Expired),
+                }
+            }
         }
     }
 
@@ -101,12 +165,17 @@ impl Gateway {
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<GatewayBody>, Infallible> {
-        let ingress = Instant::now();
+        self.handle_at(request, Instant::now()).await
+    }
+
+    pub async fn handle_at(
+        self: Arc<Self>,
+        request: Request<Incoming>,
+        ingress: Instant,
+    ) -> Result<Response<GatewayBody>, Infallible> {
         let deadline = ingress + self.config.request_timeout;
-        if !self.healthy.load(Ordering::Relaxed) {
-            return Ok(unavailable(
-                "runtime admission closed: unresolved backend work\n",
-            ));
+        if !self.admission.healthy.load(Ordering::Acquire) {
+            return Ok(unavailable("runtime admission closed\n"));
         }
         if request.method() == Method::GET && request.uri().path() == "/__bref_web/health" {
             return Ok(simple(StatusCode::OK, "ready\n"));
@@ -121,19 +190,16 @@ impl Gateway {
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
             return Ok(unavailable("runtime queue is full\n"));
         };
-        let worker = match timeout_at(
-            deadline.min(ingress + self.config.queue_timeout),
-            self.workers.clone().acquire_owned(),
-        )
-        .await
+        let worker = match self
+            .acquire_worker(deadline.min(ingress + self.config.queue_timeout))
+            .await
         {
-            Ok(Ok(permit)) => permit,
-            _ => return Ok(unavailable("runtime queue wait expired\n")),
+            Ok(permit) => permit,
+            Err(AdmissionError::Closed) => return Ok(unavailable("runtime admission closed\n")),
+            Err(AdmissionError::Expired) => return Ok(unavailable("runtime queue wait expired\n")),
         };
-        if !self.healthy.load(Ordering::Relaxed) {
-            return Ok(unavailable(
-                "runtime admission closed: unresolved backend work\n",
-            ));
+        if !self.admission.healthy.load(Ordering::Acquire) {
+            return Ok(unavailable("runtime admission closed\n"));
         }
         // Admission precedes collection: at most max_in_flight full input bodies exist.
         let (parts, mut incoming) = request.into_parts();
@@ -169,6 +235,9 @@ impl Gateway {
             Ok(Err(_)) => return Ok(simple(StatusCode::BAD_REQUEST, "invalid request body\n")),
             Ok(Ok(())) => {}
         }
+        if !self.admission.healthy.load(Ordering::Acquire) {
+            return Ok(unavailable("runtime admission closed\n"));
+        }
         let params = cgi::params(
             &self.config,
             &parts.method,
@@ -184,19 +253,24 @@ impl Gateway {
         let addr = self.config.fpm_addr.clone();
         let method = parts.method;
         let log_id = request_id.clone();
-        let healthy = self.healthy.clone();
+        let admission = self.admission.clone();
         // Separate from the frontend deadline: an HTTP timeout does not stop PHP.
         let fpm_seconds = std::env::var("BREF_WEB_FPM_TIMEOUT_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(28);
-        let accounting_budget = Duration::from_secs(fpm_seconds.saturating_add(2));
+        // Downstream backpressure may retain backend output until the HTTP
+        // cutoff closes its receiver. Leave confirmation time after both that
+        // deadline and FPM's own script cap, rather than retiring first merely
+        // because a frontend is slow.
+        let accounting_deadline =
+            confirmation_deadline(deadline, Instant::now(), Duration::from_secs(fpm_seconds));
         tokio::spawn(async move {
             // These permits belong to backend work, independently of HTTP body ownership.
             let _worker = worker;
             let _slot = slot;
             let mut head_sender = Some(head_sender);
-            let result = timeout(accounting_budget, async {
+            let result = timeout_at(accounting_deadline, async {
                 let stream = TcpStream::connect(&addr).await?;
                 let _ = stream.set_nodelay(true);
                 let (mut read_half, mut write_half) = tokio::io::split(stream);
@@ -234,7 +308,7 @@ impl Gateway {
                         "backend termination not confirmed within accounting budget",
                     );
                     publish_failure(&error, &mut head_sender, &body_sender, &task_terminal);
-                    healthy.store(false, Ordering::Relaxed);
+                    admission.retire("backend completion unconfirmed");
                     eprintln!("bref-web request_id={log_id} unresolved_backend=true admission_closed=true");
                     drop(body_sender);
                     drop(collected);
@@ -287,6 +361,14 @@ impl Gateway {
         )
         .await;
     }
+}
+
+fn confirmation_deadline(
+    frontend_deadline: Instant,
+    backend_start: Instant,
+    fpm_timeout: Duration,
+) -> Instant {
+    frontend_deadline.max(backend_start + fpm_timeout) + Duration::from_secs(2)
 }
 
 type HeadSender = oneshot::Sender<Result<cgi::Head, StatusCode>>;
@@ -438,6 +520,107 @@ mod tests {
         let mut out = vec![1, kind, 0, 1, length[0], length[1], 0, 0];
         out.extend_from_slice(bytes);
         out
+    }
+
+    fn gateway() -> Arc<Gateway> {
+        Arc::new(Gateway::new(Config {
+            endpoint: "127.0.0.1:0".into(),
+            fpm_addr: "127.0.0.1:0".into(),
+            script_filename: "/var/task/public/index.php".into(),
+            document_root: "/var/task/public".into(),
+            max_in_flight: 1,
+            queue_capacity: 1,
+            queue_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_body_bytes: 1024,
+            fpm_bin: "/opt/bin/php-fpm".into(),
+            fpm_config: "/tmp/php-fpm.conf".into(),
+            shutdown_grace: Duration::from_millis(500),
+        }))
+    }
+
+    #[tokio::test]
+    async fn closing_admission_wakes_queued_work_without_releasing_backend_reservation() {
+        let gateway = gateway();
+        let active = gateway.workers.clone().acquire_owned().await.unwrap();
+        let queued_gateway = gateway.clone();
+        let queued = tokio::spawn(async move {
+            queued_gateway
+                .acquire_worker(Instant::now() + Duration::from_secs(5))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished());
+        gateway.close_admission();
+        let result = timeout(Duration::from_millis(100), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(AdmissionError::Closed)));
+        assert_eq!(gateway.workers.available_permits(), 0);
+        assert_eq!(*gateway.retirement().borrow(), None);
+        assert!(gateway.slots.is_closed());
+        drop(active);
+        assert_eq!(gateway.workers.available_permits(), 1);
+        assert!(matches!(
+            gateway
+                .acquire_worker(Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(AdmissionError::Closed)
+        ));
+        assert_eq!(gateway.workers.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_notifies_supervisor_and_preserves_the_first_reason() {
+        let gateway = gateway();
+        let active = gateway.workers.clone().acquire_owned().await.unwrap();
+        let mut retirement = gateway.retirement();
+        let queued_gateway = gateway.clone();
+        let queued = tokio::spawn(async move {
+            queued_gateway
+                .acquire_worker(Instant::now() + Duration::from_secs(5))
+                .await
+        });
+        tokio::task::yield_now().await;
+        gateway.admission.retire("first unresolved backend");
+        gateway.admission.retire("later failure");
+        timeout(Duration::from_millis(100), retirement.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*retirement.borrow(), Some("first unresolved backend"));
+        assert_eq!(gateway.workers.available_permits(), 0);
+        assert!(matches!(
+            timeout(Duration::from_millis(100), queued)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(AdmissionError::Closed)
+        ));
+        assert!(!gateway.admission.healthy.load(Ordering::Acquire));
+        drop(active);
+    }
+
+    #[test]
+    fn confirmation_budget_follows_the_later_frontend_or_fpm_deadline() {
+        let start = Instant::now();
+        assert_eq!(
+            confirmation_deadline(
+                start + Duration::from_millis(150),
+                start,
+                Duration::from_secs(2),
+            ),
+            start + Duration::from_secs(4)
+        );
+        assert_eq!(
+            confirmation_deadline(
+                start + Duration::from_secs(10),
+                start,
+                Duration::from_secs(2),
+            ),
+            start + Duration::from_secs(12)
+        );
     }
 
     #[tokio::test]
