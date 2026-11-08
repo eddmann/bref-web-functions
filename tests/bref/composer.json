@@ -1,0 +1,25 @@
+{
+    "name": "bref-web-functions/compatibility-fixture",
+    "description": "Local compatibility tests against the real Bref package",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": "^8.4",
+        "bref/bref": "3.0.15"
+    },
+    "autoload": {
+        "psr-4": {
+            "BrefWebFixture\\": "src/"
+        },
+        "files": [
+            "bootstrap.php"
+        ]
+    },
+    "config": {
+        "allow-plugins": false,
+        "platform": {
+            "php": "8.4.27"
+        },
+        "sort-packages": true
+    }
+}
