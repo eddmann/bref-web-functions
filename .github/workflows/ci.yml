@@ -121,7 +121,7 @@ jobs:
           python3 tests/hardening/run.py \
             --binary build/ci/bref-web-gateway \
             --output results/ci/hardening.json \
-            > results/ci/hardening.log 2>&1
+            2>&1 | tee results/ci/hardening.log
 
       - name: Install locked real Bref dependencies
         run: |

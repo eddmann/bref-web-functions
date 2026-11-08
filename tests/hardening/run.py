@@ -47,7 +47,7 @@ def wait_until(predicate, timeout, message):
 
 
 class Runtime:
-    def __init__(self, binary, node, directory, log, workers=1, http_ms=300, fpm_seconds=3):
+    def __init__(self, binary, node, directory, log, workers=1, http_ms=300, fpm_seconds=3, queue=0):
         self.directory = directory
         self.log = log
         self.port, self.fpm_port = free_port(), free_port()
@@ -65,7 +65,7 @@ class Runtime:
             "BREF_WEB_FPM_BIN": str(fake), "BREF_WEB_FPM_CONFIG": str(directory / "unused-fpm.conf"),
             "BREF_WEB_FPM_ADDR": f"127.0.0.1:{self.fpm_port}",
             "AWS_LAMBDA_HTTP_ENDPOINT": f"127.0.0.1:{self.port}",
-            "BREF_WEB_MAX_IN_FLIGHT": str(workers), "BREF_WEB_QUEUE_CAPACITY": "0",
+            "BREF_WEB_MAX_IN_FLIGHT": str(workers), "BREF_WEB_QUEUE_CAPACITY": str(queue),
             "BREF_WEB_QUEUE_TIMEOUT_MS": "1000", "BREF_WEB_MAX_BODY_BYTES": "6291456",
             "BREF_WEB_REQUEST_TIMEOUT_MS": str(http_ms), "BREF_WEB_FPM_TIMEOUT_SECONDS": str(fpm_seconds),
             "BREF_WEB_SHUTDOWN_GRACE_MS": "500", "BREF_WEB_SHUTDOWN_TIMEOUT_MS": "900",
@@ -105,10 +105,11 @@ class Runtime:
         finally:
             connection.close()
 
-    def health(self):
-        status, body = self.request()
-        check(status == 200, f"Healthy request returned {status}")
-        return json.loads(body)
+    def identity(self):
+        # Reading a completed HTTP body does not imply FastCGI END_REQUEST has
+        # released its backend slot. Obtain setup identity without dispatching PHP.
+        return {"ok": True, "fake_fpm_pid": self.pids["master_pid"],
+                "rust_pid": self.pids["rust_pid"]}
 
     def events(self):
         if not self.events_path.exists():
@@ -169,7 +170,7 @@ class Suite:
 
     def retirement(self, directory, log):
         with Runtime(self.binary, self.node, directory, log, workers=2, http_ms=2500, fpm_seconds=1) as runtime:
-            original = runtime.health()
+            original = runtime.identity()
             started = time.monotonic()
             status, _ = runtime.request("/never-end", timeout=4)
             check(status == 504, f"Expected original HTTP deadline to produce 504, got {status}")
@@ -204,7 +205,7 @@ class Suite:
 
     def stalled(self, directory, log, pipeline=False):
         with Runtime(self.binary, self.node, directory, log) as runtime:
-            original = runtime.health()
+            original = runtime.identity()
             slow = socket.socket()
             slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
             slow.settimeout(1)
@@ -268,7 +269,9 @@ class Suite:
                     writer.join(timeout=2)
 
     def keepalive(self, directory, log):
-        with Runtime(self.binary, self.node, directory, log) as runtime:
+        # This case exercises connection deadlines. Allow a queued request while
+        # the previous response's FastCGI END_REQUEST releases its worker slot.
+        with Runtime(self.binary, self.node, directory, log, queue=1) as runtime:
             connection = http.client.HTTPConnection("127.0.0.1", runtime.port, timeout=1)
             started = time.monotonic()
             first_socket = None

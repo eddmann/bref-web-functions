@@ -39,6 +39,8 @@ and all nine real Bref checks in the managed Node base image. The CI workflow
 includes the new regressions on both native architectures; these local results
 do not by themselves establish ARM64 coverage of the change or AWS replacement
 behavior after a fatal runtime exit.
+The corresponding native CI results are linked from the
+[hardening PR checks](https://github.com/eddmann/bref-web-functions/pull/1/checks).
 
 ## What the archive tests establish
 
