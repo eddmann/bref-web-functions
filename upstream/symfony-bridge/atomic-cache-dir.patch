@@ -1,0 +1,53 @@
+diff --git a/src/BrefKernel.php b/src/BrefKernel.php
+index 6e5b481..cc50272 100644
+--- a/src/BrefKernel.php
++++ b/src/BrefKernel.php
+@@ -91,13 +91,18 @@ abstract class BrefKernel extends Kernel
+         $startTime = microtime(true);
+         $cacheDirectoriesToCopy = $this->getWritableCacheDirectories();
+         $filesystem = new Filesystem;
+-        $filesystem->mkdir($writeDir);
+ 
+         $scandir = scandir($readOnlyDir, SCANDIR_SORT_NONE);
+         if ($scandir === false) {
+             return;
+         }
+ 
++        // Several PHP-FPM workers can prepare the cache at the same time. Each
++        // builds its own copy, then renames it into place: exactly one rename
++        // succeeds and the others discard their copy.
++        $buildDir = $writeDir . '.' . getmypid() . '.' . bin2hex(random_bytes(4));
++        $filesystem->mkdir($buildDir);
++
+         foreach ($scandir as $item) {
+             if (in_array($item, ['.', '..'])) {
+                 continue;
+@@ -105,19 +110,25 @@ abstract class BrefKernel extends Kernel
+ 
+             // Copy directories to a writable space on Lambda.
+             if (in_array($item, $cacheDirectoriesToCopy)) {
+-                $filesystem->mirror("$readOnlyDir/$item", "$writeDir/$item");
++                $filesystem->mirror("$readOnlyDir/$item", "$buildDir/$item");
+                 continue;
+             }
+ 
+             // Symlink all other directories
+             // This is especially important with the Container* directories since it uses require_once statements
+             if (is_dir("$readOnlyDir/$item")) {
+-                $filesystem->symlink("$readOnlyDir/$item", "$writeDir/$item");
++                $filesystem->symlink("$readOnlyDir/$item", "$buildDir/$item");
+                 continue;
+             }
+ 
+             // Copy all other files.
+-            $filesystem->copy("$readOnlyDir/$item", "$writeDir/$item");
++            $filesystem->copy("$readOnlyDir/$item", "$buildDir/$item");
++        }
++
++        if (! @rename($buildDir, $writeDir)) {
++            // Another worker finished first.
++            $filesystem->remove($buildDir);
++            return;
+         }
+ 
+         $this->logToStderr(sprintf(

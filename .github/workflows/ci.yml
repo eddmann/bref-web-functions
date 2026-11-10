@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  infra:
+    name: AWS CDK app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra/aws
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Type-check and test the stack
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm test
+
+  native:
+    name: Native ${{ matrix.architecture }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            rust-target: x86_64-unknown-linux-musl
+            bref-image: bref/php-84@sha256:cf1cd6aeeed301781b6a04a741fdecd6d40c1079bb25549b82df10c69633870f
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            rust-target: aarch64-unknown-linux-musl
+            bref-image: bref/arm-php-84@sha256:472f7ce7118a68a95c1c90c0aa1291af554f7fcff325993b7eee4d147d38f57f
+    defaults:
+      run:
+        shell: bash
+    env:
+      BREF_WEB_IMAGE: bref-web-functions:local
+      COMPOSER_VERSION: 2.11.1
+      COMPOSER_SHA256: 6f1b891e1d4927d62740276c540fb490e47689e19e102c49e8da849794882f8c
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check source syntax and archive behavior
+        run: |
+          set -euo pipefail
+          mkdir -p results/ci build/ci
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          for directory in ("scripts", "packaging", "tests"):
+              for path in Path(directory).rglob("*.py"):
+                  if "vendor" not in path.parts:
+                      compile(path.read_text(), str(path), "exec")
+          for directory in ("runtime", "scripts"):
+              for path in Path(directory).rglob("*.sh"):
+                  subprocess.run(["bash", "-n", str(path)], check=True)
+          for path in [*Path("runtime/launcher").glob("*.*js"), Path("scripts/package.mjs")]:
+              subprocess.run(["node", "--check", str(path)], check=True)
+          PY
+          python3 packaging/tests.py > results/ci/package-unit-tests.log 2>&1
+
+      - name: Build native image and run Rust unit tests
+        run: |
+          set -euo pipefail
+          ./scripts/build.sh \
+            --build-arg RUN_RUST_TESTS=1 \
+            --build-arg RUST_TARGET='${{ matrix.rust-target }}' \
+            --build-arg BREF_IMAGE='${{ matrix.bref-image }}' \
+            2>&1 | tee results/ci/build.log
+
+      - name: Check shared PHP initialization
+        run: |
+          set -euo pipefail
+          BREF_WEB_TEST_IMAGE="$BREF_WEB_IMAGE" ./runtime/php/tests.sh \
+            > results/ci/compat-tests.log 2>&1
+
+      - name: Export the tested runtime and gateway
+        run: |
+          set -euo pipefail
+          export_container="$(docker create "$BREF_WEB_IMAGE")"
+          trap 'docker rm -f "$export_container" >/dev/null' EXIT
+          docker cp "$export_container:/opt" build/ci/runtime
+          docker cp "$export_container:/usr/local/bin/bref-web-gateway" build/ci/bref-web-gateway
+
+      - name: Test exact native smoke and integration ZIPs
+        run: |
+          set -euo pipefail
+          node scripts/package.mjs \
+            --runtime-dir build/ci/runtime \
+            --rust-binary build/ci/bref-web-gateway \
+            --architecture '${{ matrix.architecture }}' \
+            --output build/ci/smoke.zip \
+            > results/ci/smoke-package-build.json
+          python3 scripts/test-package.py build/ci/smoke.zip \
+            --output results/ci/package-smoke \
+            > results/ci/package-smoke.log 2>&1
+          node scripts/package.mjs \
+            --runtime-dir build/ci/runtime \
+            --rust-binary build/ci/bref-web-gateway \
+            --architecture '${{ matrix.architecture }}' \
+            --app-dir tests/fixtures \
+            --output build/ci/destructive-test-only.zip \
+            > results/ci/integration-package-build.json
+          python3 scripts/test-package.py build/ci/destructive-test-only.zip \
+            --suite integration --output results/ci/package-integration \
+            > results/ci/package-integration.log 2>&1
+          python3 scripts/test-package.py build/ci/destructive-test-only.zip \
+            --suite lifecycle --output results/ci/package-lifecycle \
+            > results/ci/package-lifecycle.log 2>&1
+
+      - name: Build and test the AWS exploration archives
+        run: |
+          set -euo pipefail
+          mkdir -p build/aws
+          # Deployable diagnostic page: non-destructive, safe for any account.
+          node scripts/package.mjs \
+            --runtime-dir build/ci/runtime \
+            --rust-binary build/ci/bref-web-gateway \
+            --architecture '${{ matrix.architecture }}' \
+            --app-dir examples/diagnostic \
+            --output build/aws/diagnostic.zip \
+            > results/ci/diagnostic-package-build.json
+          python3 scripts/test-package.py build/aws/diagnostic.zip \
+            --output results/ci/package-diagnostic \
+            > results/ci/package-diagnostic.log 2>&1
+          # Test-only routes (slow, streaming, crashing, stuck) for an isolated
+          # account. The local check includes real-FPM runtime retirement.
+          tests/aws/build-app.sh build/ci/aws-test-app
+          node scripts/package.mjs \
+            --runtime-dir build/ci/runtime \
+            --rust-binary build/ci/bref-web-gateway \
+            --architecture '${{ matrix.architecture }}' \
+            --app-dir build/ci/aws-test-app \
+            --output build/aws/aws-test-only.zip \
+            > results/ci/aws-test-package-build.json
+          python3 tests/aws/local_check.py build/aws/aws-test-only.zip \
+            --output results/ci/aws-local \
+            > results/ci/aws-local.log 2>&1
+
+      - name: Upload tested AWS exploration archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: aws-archives-${{ matrix.architecture }}
+          path: |
+            build/aws/*.zip
+            build/aws/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check runtime retirement and stalled connections
+        run: |
+          set -euo pipefail
+          python3 tests/hardening/run.py \
+            --binary build/ci/bref-web-gateway \
+            --output results/ci/hardening.json \
+            2>&1 | tee results/ci/hardening.log
+
+      - name: Install locked real Bref dependencies
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar" \
+            --output build/ci/composer.phar
+          printf '%s  %s\n' "$COMPOSER_SHA256" build/ci/composer.phar | sha256sum --check
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --read-only --tmpfs /tmp:rw,size=256m,mode=1777 \
+            --env COMPOSER_HOME=/tmp/composer \
+            --env COMPOSER_CACHE_DIR=/tmp/composer-cache \
+            --mount "type=bind,src=$PWD/tests/bref,dst=/app" \
+            --mount "type=bind,src=$PWD/build/ci/composer.phar,dst=/tmp/composer.phar,readonly" \
+            --workdir /app --entrypoint /opt/bin/php "$BREF_WEB_IMAGE" \
+            /tmp/composer.phar install --no-dev --no-scripts --no-plugins \
+            --prefer-dist --no-interaction --classmap-authoritative \
+            > results/ci/composer-install.log 2>&1
+
+      - name: Test the exact native ZIP with real Bref
+        run: |
+          set -euo pipefail
+          node scripts/package.mjs \
+            --runtime-dir build/ci/runtime \
+            --rust-binary build/ci/bref-web-gateway \
+            --architecture '${{ matrix.architecture }}' \
+            --app-dir tests/bref \
+            --output build/ci/real-bref-test-only.zip \
+            > results/ci/real-bref-package-build.json
+          python3 scripts/test-package.py build/ci/real-bref-test-only.zip \
+            --suite bref --body-limit 1200001 --output results/ci/package-real-bref \
+            > results/ci/package-real-bref.log 2>&1
+
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-${{ matrix.architecture }}
+          path: |
+            results/ci/**/*.json
+            results/ci/**/*.log
+          if-no-files-found: warn
+          retention-days: 7
